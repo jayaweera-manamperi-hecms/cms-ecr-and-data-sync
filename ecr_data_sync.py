@@ -9,9 +9,9 @@ Flow:
   2. Ask the user whether to continue.
   3. Invoke a Lambda in the Destination Account to copy the image over.
   4. Verify the image now exists in the Destination Account's ECR.
-  5. Run DataSync task 1, then (if it succeeds) DataSync task 2.
-  6. Task 2 triggers a CodePipeline execution that runs a CodeBuild
-     project; tail its logs and report the final build status.
+  5. Run the App DataSync Task, then (if it succeeds) the Infra DataSync Task.
+  6. The Infra DataSync Task triggers a CodePipeline execution that runs a
+     CodeBuild project; tail its logs and report the final build status.
 """
 
 import argparse
@@ -24,7 +24,12 @@ import boto3
 from botocore.exceptions import ClientError
 
 DEFAULT_REGION = "us-east-1"
+DEFAULT_PROFILE_A = "cms-dev"
+DEFAULT_PROFILE_B = "cms-test"
 DEFAULT_LAMBDA_NAME = "ecr-image-sync"
+DEFAULT_APP_DATASYNC_TASK = "hp-cms-poc-app-artifacts-cms-non-prod-datasync"
+DEFAULT_INFRA_DATASYNC_TASK = "hp-cms-poc-infra-artifacts-cms-non-prod-datasync"
+DEFAULT_PIPELINE_NAME = "hp-cms-test-application-deploy-pipeline"
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNDEFINED"]
 
@@ -37,22 +42,22 @@ def prompt(text, default=None):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Copy an ECR image from the Source Account to the Destination Account and run the sync pipeline.")
-    p.add_argument("--profile-a", help="AWS CLI profile for the Source Account")
-    p.add_argument("--profile-b", help="AWS CLI profile for the Destination Account")
+    p.add_argument("--profile-a", help=f"AWS CLI profile for the Source Account (default: {DEFAULT_PROFILE_A})")
+    p.add_argument("--profile-b", help=f"AWS CLI profile for the Destination Account (default: {DEFAULT_PROFILE_B})")
     p.add_argument("--region", help=f"AWS region for all calls (default: {DEFAULT_REGION})")
     p.add_argument("--repo", help="Full repo:tag, e.g. cms/iplus/iplus-payment835-extract-service:0.0.28-RELEASE")
     p.add_argument("--lambda-name", help=f"Lambda function name in the Destination Account (default: {DEFAULT_LAMBDA_NAME})")
-    p.add_argument("--datasync-task1", help="First DataSync task ID or ARN (Destination Account)")
-    p.add_argument("--datasync-task2", help="Second DataSync task ID or ARN (Destination Account)")
-    p.add_argument("--pipeline-name", help="CodePipeline name triggered by the second DataSync task (Destination Account)")
+    p.add_argument("--app-datasync-task", help=f"App DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_APP_DATASYNC_TASK})")
+    p.add_argument("--infra-datasync-task", help=f"Infra DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_INFRA_DATASYNC_TASK})")
+    p.add_argument("--pipeline-name", help=f"CodePipeline name triggered by the Infra DataSync Task (Destination Account) (default: {DEFAULT_PIPELINE_NAME})")
     p.add_argument("--dry-run", action="store_true", help="Show what would be done without copying the image or running DataSync/CodePipeline")
     return p.parse_args()
 
 
 def resolve_config(args):
     cfg = {}
-    cfg["profile_a"] = args.profile_a or prompt("AWS profile for the Source Account")
-    cfg["profile_b"] = args.profile_b or prompt("AWS profile for the Destination Account")
+    cfg["profile_a"] = args.profile_a or prompt("AWS profile for the Source Account", DEFAULT_PROFILE_A)
+    cfg["profile_b"] = args.profile_b or prompt("AWS profile for the Destination Account", DEFAULT_PROFILE_B)
     cfg["region"] = args.region or DEFAULT_REGION
 
     repo_full = args.repo
@@ -70,9 +75,9 @@ def resolve_config(args):
     cfg["repo"], cfg["tag"] = repo_full.rsplit(":", 1)
 
     cfg["lambda_name"] = args.lambda_name or DEFAULT_LAMBDA_NAME
-    cfg["datasync_task1"] = args.datasync_task1 or prompt("First DataSync task ID or ARN")
-    cfg["datasync_task2"] = args.datasync_task2 or prompt("Second DataSync task ID or ARN")
-    cfg["pipeline_name"] = args.pipeline_name or prompt("CodePipeline name")
+    cfg["app_datasync_task"] = args.app_datasync_task or prompt("App DataSync Task name (or ARN)", DEFAULT_APP_DATASYNC_TASK)
+    cfg["infra_datasync_task"] = args.infra_datasync_task or prompt("Infra DataSync Task name (or ARN)", DEFAULT_INFRA_DATASYNC_TASK)
+    cfg["pipeline_name"] = args.pipeline_name or prompt("CodePipeline name", DEFAULT_PIPELINE_NAME)
     cfg["dry_run"] = args.dry_run
     return cfg
 
@@ -85,8 +90,8 @@ def confirm_config(cfg):
     print(f"  Repository          : {cfg['repo']}")
     print(f"  Tag                 : {cfg['tag']}")
     print(f"  Lambda function     : {cfg['lambda_name']}")
-    print(f"  DataSync task 1     : {cfg['datasync_task1']}")
-    print(f"  DataSync task 2     : {cfg['datasync_task2']}")
+    print(f"  App DataSync Task   : {cfg['app_datasync_task']} (name or ARN)")
+    print(f"  Infra DataSync Task : {cfg['infra_datasync_task']} (name or ARN)")
     print(f"  CodePipeline name   : {cfg['pipeline_name']}")
     if cfg["dry_run"]:
         print(f"  Mode                : DRY RUN (no changes will be made)")
@@ -218,10 +223,26 @@ def wait_for_image_in_account_b(ecr_client, repo, tag, timeout=300, interval=15)
     sys.exit(f"Timed out waiting for {repo}:{tag} to appear in the Destination Account.")
 
 
-def resolve_datasync_arn(task_id_or_arn, region, account_id):
-    if task_id_or_arn.startswith("arn:"):
-        return task_id_or_arn
-    return f"arn:aws:datasync:{region}:{account_id}:task/{task_id_or_arn}"
+def resolve_datasync_arn(datasync_client, task_name_or_arn):
+    if task_name_or_arn.startswith("arn:"):
+        return task_name_or_arn
+
+    matches = []
+    paginator = datasync_client.get_paginator("list_tasks")
+    for page in paginator.paginate():
+        for task in page.get("Tasks", []):
+            if task.get("Name") == task_name_or_arn:
+                matches.append(task["TaskArn"])
+
+    if not matches:
+        sys.exit(f"No DataSync task named {task_name_or_arn!r} was found in the Destination Account.")
+    if len(matches) > 1:
+        listed = "\n".join(f"    - {arn}" for arn in matches)
+        sys.exit(
+            f"Multiple DataSync tasks are named {task_name_or_arn!r} in the Destination Account:\n{listed}\n"
+            "Re-run and pass one of these ARNs directly instead of the name."
+        )
+    return matches[0]
 
 
 def run_datasync_task(datasync_client, task_arn, label, poll_interval=10):
@@ -320,7 +341,7 @@ def main():
 
     print("\n=== Verifying credentials ===")
     get_account_id(session_a, "Source Account")
-    account_b_id = get_account_id(session_b, "Destination Account")
+    get_account_id(session_b, "Destination Account")
 
     ecr_a = session_a.client("ecr")
     ecr_b = session_b.client("ecr")
@@ -334,15 +355,16 @@ def main():
     if prompt("\nContinue with copying this image to the Destination Account? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after reviewing vulnerabilities.")
 
-    task1_arn = resolve_datasync_arn(cfg["datasync_task1"], cfg["region"], account_b_id)
-    task2_arn = resolve_datasync_arn(cfg["datasync_task2"], cfg["region"], account_b_id)
+    datasync_b = session_b.client("datasync")
+    app_task_arn = resolve_datasync_arn(datasync_b, cfg["app_datasync_task"])
+    infra_task_arn = resolve_datasync_arn(datasync_b, cfg["infra_datasync_task"])
 
     if cfg["dry_run"]:
         print("\n=== Dry run: no changes will be made ===")
         print(f"  Would invoke Lambda '{cfg['lambda_name']}' in the Destination Account to copy {cfg['repo']}:{cfg['tag']} from the Source Account.")
         print(f"  Would wait for {cfg['repo']}:{cfg['tag']} to appear in the Destination Account's ECR.")
-        print(f"  Would start DataSync task 1 ({task1_arn}) and wait for SUCCESS.")
-        print(f"  Would start DataSync task 2 ({task2_arn}) and wait for SUCCESS.")
+        print(f"  Would start the App DataSync Task ({app_task_arn}) and wait for SUCCESS.")
+        print(f"  Would start the Infra DataSync Task ({infra_task_arn}) and wait for SUCCESS.")
         print(f"  Would wait for a new execution of CodePipeline '{cfg['pipeline_name']}' and tail its CodeBuild logs.")
         sys.exit(0)
 
@@ -352,14 +374,13 @@ def main():
     wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
 
     print("\n=== Running DataSync tasks ===")
-    datasync_b = session_b.client("datasync")
 
-    if not run_datasync_task(datasync_b, task1_arn, "DataSync task 1"):
-        sys.exit("DataSync task 1 failed; aborting.")
+    if not run_datasync_task(datasync_b, app_task_arn, "App DataSync Task"):
+        sys.exit("App DataSync Task failed; aborting.")
 
     trigger_time = datetime.now(timezone.utc)
-    if not run_datasync_task(datasync_b, task2_arn, "DataSync task 2"):
-        sys.exit("DataSync task 2 failed; aborting.")
+    if not run_datasync_task(datasync_b, infra_task_arn, "Infra DataSync Task"):
+        sys.exit("Infra DataSync Task failed; aborting.")
 
     print("\n=== Waiting for CodePipeline / CodeBuild ===")
     codepipeline_b = session_b.client("codepipeline")
