@@ -286,14 +286,15 @@ def find_new_pipeline_execution(codepipeline_client, pipeline_name, after_time, 
 def get_codebuild_build_id(codepipeline_client, pipeline_name, execution_id, timeout=180, poll_interval=10):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        state = codepipeline_client.get_pipeline_state(name=pipeline_name)
-        for stage in state.get("stageStates", []):
-            for action in stage.get("actionStates", []):
-                latest = action.get("latestExecution", {})
-                if latest.get("pipelineExecutionId") == execution_id and "externalExecutionId" in latest:
-                    build_id = latest["externalExecutionId"]
-                    print(f"  Found CodeBuild build: {build_id}")
-                    return build_id
+        resp = codepipeline_client.list_action_executions(
+            pipelineName=pipeline_name,
+            filter={"pipelineExecutionId": execution_id},
+        )
+        for detail in resp.get("actionExecutionDetails", []):
+            build_id = detail.get("output", {}).get("executionResult", {}).get("externalExecutionId")
+            if build_id:
+                print(f"  Found CodeBuild build: {build_id}")
+                return build_id
         time.sleep(poll_interval)
     sys.exit(f"Timed out waiting for the CodeBuild action to start for execution {execution_id}.")
 
@@ -377,16 +378,25 @@ def main():
     invoke_copy_lambda(lambda_b, cfg["lambda_name"], cfg["repo"], cfg["tag"])
     wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
 
+    if prompt("\nContinue with running the DataSync tasks? [y/N]", "N").lower() != "y":
+        sys.exit("Aborted by user after copying the image.")
+
     print("\n=== Running DataSync tasks ===")
 
     app_task_arn = resolve_datasync_arn(datasync_b, cfg["app_datasync_task"])
     if not run_datasync_task(datasync_b, app_task_arn, "App DataSync Task"):
         sys.exit("App DataSync Task failed; aborting.")
 
+    if prompt("\nContinue with running the Infra DataSync Task? [y/N]", "N").lower() != "y":
+        sys.exit("Aborted by user after the App DataSync Task.")
+
     infra_task_arn = resolve_datasync_arn(datasync_b, cfg["infra_datasync_task"])
     trigger_time = datetime.now(timezone.utc)
     if not run_datasync_task(datasync_b, infra_task_arn, "Infra DataSync Task"):
         sys.exit("Infra DataSync Task failed; aborting.")
+
+    if prompt("\nContinue with waiting for CodePipeline / CodeBuild? [y/N]", "N").lower() != "y":
+        sys.exit("Aborted by user after the Infra DataSync Task.")
 
     print("\n=== Waiting for CodePipeline / CodeBuild ===")
     codepipeline_b = session_b.client("codepipeline")
