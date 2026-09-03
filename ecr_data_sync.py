@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument("--profile-a", help=f"AWS CLI profile for the Source Account (default: {DEFAULT_PROFILE_A})")
     p.add_argument("--profile-b", help=f"AWS CLI profile for the Destination Account (default: {DEFAULT_PROFILE_B})")
     p.add_argument("--region", help=f"AWS region for all calls (default: {DEFAULT_REGION})")
-    p.add_argument("--repo", help="Full repo:tag, e.g. cms/iplus/iplus-payment835-extract-service:0.0.28-RELEASE")
+    p.add_argument("--repo", help="Full repo:tag, e.g. cms/iplus/iplus-payment835-extract-service:0.0.28-RELEASE (pass - to skip the image scan/copy)")
     p.add_argument("--lambda-name", help=f"Lambda function name in the Destination Account (default: {DEFAULT_LAMBDA_NAME})")
     p.add_argument("--app-datasync-task", help=f"App DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_APP_DATASYNC_TASK})")
     p.add_argument("--infra-datasync-task", help=f"Infra DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_INFRA_DATASYNC_TASK})")
@@ -68,17 +68,22 @@ def resolve_config(args):
 
     repo_full = args.repo
     if repo_full:
-        if ":" not in repo_full:
-            sys.exit(f"Invalid --repo value: {repo_full!r} (expected <repo-path>:<tag>)")
+        if repo_full != "-" and ":" not in repo_full:
+            sys.exit(f"Invalid --repo value: {repo_full!r} (expected <repo-path>:<tag>, or - for no image)")
     else:
         while True:
             repo_full = prompt(
-                "Repo and tag (e.g. cms/iplus/iplus-payment835-extract-service:0.0.28-RELEASE)"
+                "Repo and tag (e.g. cms/iplus/iplus-payment835-extract-service:0.0.28-RELEASE, or - for no image)"
             )
-            if repo_full and ":" in repo_full:
+            if repo_full == "-" or (repo_full and ":" in repo_full):
                 break
-            print(f"  Invalid value: {repo_full!r} (expected <repo-path>:<tag>)")
-    cfg["repo"], cfg["tag"] = repo_full.rsplit(":", 1)
+            print(f"  Invalid value: {repo_full!r} (expected <repo-path>:<tag>, or - for no image)")
+
+    cfg["has_image"] = repo_full != "-"
+    if cfg["has_image"]:
+        cfg["repo"], cfg["tag"] = repo_full.rsplit(":", 1)
+    else:
+        cfg["repo"], cfg["tag"] = None, None
 
     cfg["lambda_name"] = args.lambda_name or DEFAULT_LAMBDA_NAME
     cfg["app_datasync_task"] = args.app_datasync_task or prompt("App DataSync Task name (or ARN)", DEFAULT_APP_DATASYNC_TASK)
@@ -93,8 +98,11 @@ def confirm_config(cfg):
     print(f"  Source Account profile      : {cfg['profile_a']}")
     print(f"  Destination Account profile : {cfg['profile_b']}")
     print(f"  Region              : {cfg['region']}")
-    print(f"  Repository          : {cfg['repo']}")
-    print(f"  Tag                 : {cfg['tag']}")
+    if cfg["has_image"]:
+        print(f"  Repository          : {cfg['repo']}")
+        print(f"  Tag                 : {cfg['tag']}")
+    else:
+        print(f"  Repository          : (none - image scan/copy will be skipped)")
     print(f"  Lambda function     : {cfg['lambda_name']}")
     print(f"  App DataSync Task   : {cfg['app_datasync_task']} (name or ARN)")
     print(f"  Infra DataSync Task : {cfg['infra_datasync_task']} (name or ARN)")
@@ -350,22 +358,26 @@ def main():
     get_account_id(session_a, "Source Account")
     get_account_id(session_b, "Destination Account")
 
-    ecr_a = session_a.client("ecr")
-    ecr_b = session_b.client("ecr")
+    if cfg["has_image"]:
+        ecr_a = session_a.client("ecr")
+        ecr_b = session_b.client("ecr")
 
-    print("\n=== Verifying image in the Source Account ===")
-    verify_image_exists(ecr_a, cfg["repo"], cfg["tag"], "the Source Account")
+        print("\n=== Verifying image in the Source Account ===")
+        verify_image_exists(ecr_a, cfg["repo"], cfg["tag"], "the Source Account")
 
-    print("\n=== Vulnerability findings ===")
-    show_vulnerabilities(ecr_a, cfg["repo"], cfg["tag"])
+        print("\n=== Vulnerability findings ===")
+        show_vulnerabilities(ecr_a, cfg["repo"], cfg["tag"])
 
-    if prompt("\nContinue with copying this image to the Destination Account? [y/N]", "N").lower() != "y":
-        sys.exit("Aborted by user after reviewing vulnerabilities.")
+        if prompt("\nContinue with copying this image to the Destination Account? [y/N]", "N").lower() != "y":
+            sys.exit("Aborted by user after reviewing vulnerabilities.")
+    else:
+        print("\n=== No image specified: skipping the image scan and copy ===")
 
     if cfg["dry_run"]:
         print("\n=== Dry run: no changes will be made ===")
-        print(f"  Would invoke Lambda '{cfg['lambda_name']}' in the Destination Account to copy {cfg['repo']}:{cfg['tag']} from the Source Account.")
-        print(f"  Would wait for {cfg['repo']}:{cfg['tag']} to appear in the Destination Account's ECR.")
+        if cfg["has_image"]:
+            print(f"  Would invoke Lambda '{cfg['lambda_name']}' in the Destination Account to copy {cfg['repo']}:{cfg['tag']} from the Source Account.")
+            print(f"  Would wait for {cfg['repo']}:{cfg['tag']} to appear in the Destination Account's ECR.")
         print(f"  Would start the App DataSync Task ({cfg['app_datasync_task']}) and wait for SUCCESS.")
         print(f"  Would start the Infra DataSync Task ({cfg['infra_datasync_task']}) and wait for SUCCESS.")
         print(f"  Would wait for a new execution of CodePipeline '{cfg['pipeline_name']}' and tail its CodeBuild logs.")
@@ -373,10 +385,12 @@ def main():
 
     datasync_b = session_b.client("datasync")
 
-    print("\n=== Copying image to the Destination Account ===")
-    lambda_b = session_b.client("lambda")
-    invoke_copy_lambda(lambda_b, cfg["lambda_name"], cfg["repo"], cfg["tag"])
-    wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
+    if cfg["has_image"]:
+        print("\n=== Copying image to the Destination Account ===")
+        ecr_b = session_b.client("ecr")
+        lambda_b = session_b.client("lambda")
+        invoke_copy_lambda(lambda_b, cfg["lambda_name"], cfg["repo"], cfg["tag"])
+        wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
 
     if prompt("\nContinue with running the DataSync tasks? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after copying the image.")
