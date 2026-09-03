@@ -50,7 +50,13 @@ def parse_args():
     p.add_argument("--app-datasync-task", help=f"App DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_APP_DATASYNC_TASK})")
     p.add_argument("--infra-datasync-task", help=f"Infra DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_INFRA_DATASYNC_TASK})")
     p.add_argument("--pipeline-name", help=f"CodePipeline name triggered by the Infra DataSync Task (Destination Account) (default: {DEFAULT_PIPELINE_NAME})")
-    p.add_argument("--dry-run", action="store_true", help="Show what would be done without copying the image or running DataSync/CodePipeline")
+    p.add_argument(
+        "--no-dry-run",
+        dest="dry_run",
+        action="store_false",
+        default=True,
+        help="Actually copy the image and run DataSync/CodePipeline (default is dry-run: show what would be done without making changes)",
+    )
     return p.parse_args()
 
 
@@ -355,18 +361,16 @@ def main():
     if prompt("\nContinue with copying this image to the Destination Account? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after reviewing vulnerabilities.")
 
-    datasync_b = session_b.client("datasync")
-    app_task_arn = resolve_datasync_arn(datasync_b, cfg["app_datasync_task"])
-    infra_task_arn = resolve_datasync_arn(datasync_b, cfg["infra_datasync_task"])
-
     if cfg["dry_run"]:
         print("\n=== Dry run: no changes will be made ===")
         print(f"  Would invoke Lambda '{cfg['lambda_name']}' in the Destination Account to copy {cfg['repo']}:{cfg['tag']} from the Source Account.")
         print(f"  Would wait for {cfg['repo']}:{cfg['tag']} to appear in the Destination Account's ECR.")
-        print(f"  Would start the App DataSync Task ({app_task_arn}) and wait for SUCCESS.")
-        print(f"  Would start the Infra DataSync Task ({infra_task_arn}) and wait for SUCCESS.")
+        print(f"  Would start the App DataSync Task ({cfg['app_datasync_task']}) and wait for SUCCESS.")
+        print(f"  Would start the Infra DataSync Task ({cfg['infra_datasync_task']}) and wait for SUCCESS.")
         print(f"  Would wait for a new execution of CodePipeline '{cfg['pipeline_name']}' and tail its CodeBuild logs.")
         sys.exit(0)
+
+    datasync_b = session_b.client("datasync")
 
     print("\n=== Copying image to the Destination Account ===")
     lambda_b = session_b.client("lambda")
@@ -375,9 +379,11 @@ def main():
 
     print("\n=== Running DataSync tasks ===")
 
+    app_task_arn = resolve_datasync_arn(datasync_b, cfg["app_datasync_task"])
     if not run_datasync_task(datasync_b, app_task_arn, "App DataSync Task"):
         sys.exit("App DataSync Task failed; aborting.")
 
+    infra_task_arn = resolve_datasync_arn(datasync_b, cfg["infra_datasync_task"])
     trigger_time = datetime.now(timezone.utc)
     if not run_datasync_task(datasync_b, infra_task_arn, "Infra DataSync Task"):
         sys.exit("Infra DataSync Task failed; aborting.")
