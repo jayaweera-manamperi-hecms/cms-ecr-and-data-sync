@@ -17,6 +17,10 @@ pauses for confirmation before every major step.
    - Asks whether to continue, based on those findings.
    - Invokes a Lambda in the Destination Account to copy the image over.
    - Verifies the image now exists in the Destination Account's ECR.
+   - Reads and prints the vulnerability scan findings already available for
+     the copied image in the Destination Account (the destination repo uses
+     continuous scanning, so no manual scan is triggered there — see
+     [Destination Account scan findings](#destination-account-scan-findings)).
 
    Pass `-` instead of a `repo:tag` to skip this whole step (see
    [Skipping the image copy](#skipping-the-image-copy)).
@@ -29,8 +33,11 @@ pauses for confirmation before every major step.
    the CodeBuild build it ran, tails its CloudWatch logs live, and reports
    the final build status.
 
+   Pass `-` instead of a pipeline name to skip this whole step (see
+   [Skipping the CodePipeline/CodeBuild wait](#skipping-the-codepipelinecodebuild-wait)).
+
 The script never starts, stops, or approves anything in CodePipeline or
-CodeBuild — steps 6 only reads/polls state that the Infra DataSync Task is
+CodeBuild — step 6 only reads/polls state that the Infra DataSync Task is
 expected to have triggered on its own.
 
 ## Prerequisites
@@ -57,7 +64,7 @@ expected to have triggered on its own.
 
 **Destination Account profile** needs:
 - `sts:GetCallerIdentity`
-- `ecr:DescribeImages` (only used when an image is given)
+- `ecr:DescribeImages`, `ecr:DescribeImageScanFindings` (only used when an image is given)
 - `lambda:InvokeFunction` on the copy Lambda (only used when an image is given)
 - `datasync:ListTasks`, `datasync:StartTaskExecution`, `datasync:DescribeTaskExecution`
 - `codepipeline:ListPipelineExecutions`, `codepipeline:ListActionExecutions`
@@ -70,7 +77,9 @@ The script defaults to a **dry run**: it resolves and confirms
 configuration, verifies credentials, and (if an image was given) verifies
 the image and shows vulnerability findings, but stops short of making any
 changes and just prints what it would do. Pass `--no-dry-run` to actually
-copy the image and run DataSync/CodePipeline.
+copy the image and run DataSync/CodePipeline. The confirmation screen's
+`Mode` line reflects which one is active: `DRY RUN (no changes will be
+made)` or `REAL RUN (NO DRY RUN)`.
 
 ```
 python3 ecr_data_sync.py \
@@ -97,7 +106,7 @@ shown below.
 | `--lambda-name` | `ecr-image-sync` |
 | `--app-datasync-task` | prompted; bare task name or full ARN |
 | `--infra-datasync-task` | prompted; bare task name or full ARN |
-| `--pipeline-name` | prompted |
+| `--pipeline-name` | prompted; pass `-` to skip waiting on CodePipeline/CodeBuild |
 | `--no-dry-run` | omit to dry-run (default); pass to make real changes |
 
 A bare DataSync task name is resolved to its ARN via `datasync:ListTasks`
@@ -112,6 +121,26 @@ verification, vulnerability scan, and Lambda copy entirely — the
 Destination Account's ECR is left untouched, and the script moves straight
 to the DataSync/CodePipeline confirmations and steps.
 
+### Destination Account scan findings
+
+After the copied image is confirmed to exist in the Destination Account,
+the script reads and prints its vulnerability scan findings the same way
+it does for the Source Account — except it does **not** call
+`ecr:StartImageScan` there. The destination repository is configured for
+continuous scanning, which doesn't support (or need) a manually triggered
+scan; findings are simply read via `ecr:DescribeImageScanFindings`, which
+are already kept up to date automatically. (`show_vulnerabilities(...,
+trigger_scan=False)` is how this is implemented; the Source Account call
+uses the default `trigger_scan=True`.)
+
+### Skipping the CodePipeline/CodeBuild wait
+
+Some runs don't need to wait on the pipeline (e.g. an image-copy-only or
+DataSync-only run, or a pipeline that isn't wired up yet). Pass
+`--pipeline-name -` (or type `-` at the interactive prompt) to skip finding
+the pipeline execution, finding its CodeBuild build, and tailing logs —
+the script exits `0` right after the Infra DataSync Task succeeds.
+
 ### Confirmations
 
 With defaults, you'll be asked to confirm at each of these points before
@@ -120,13 +149,15 @@ anything below it happens:
 2. After reviewing vulnerability findings, before copying the image (skipped with `--repo -`).
 3. After the image copy is verified, before running the DataSync tasks (skipped with `--repo -`).
 4. After the App DataSync Task succeeds, before running the Infra DataSync Task.
-5. After the Infra DataSync Task succeeds, before waiting on CodePipeline/CodeBuild.
+5. After the Infra DataSync Task succeeds, before waiting on CodePipeline/CodeBuild (skipped with `--pipeline-name -`).
 
 Answering anything other than `y` at any of these aborts the run immediately.
 
 ### Exit codes
 
-- `0` — dry run completed, or CodeBuild finished with status `SUCCEEDED`.
+- `0` — dry run completed, the CodePipeline/CodeBuild wait was skipped
+  (`--pipeline-name -`) and the Infra DataSync Task succeeded, or
+  CodeBuild finished with status `SUCCEEDED`.
 - `1` — CodeBuild finished with any other status.
 - Non-zero with a message — aborted earlier (bad credentials, image not
   found, user declined a prompt, Lambda error, DataSync task failure, or a
@@ -139,12 +170,12 @@ Answering anything other than `y` at any of these aborts the run immediately.
 |---|---|
 | `prompt(text, default)` | `input()` wrapper that falls back to a default. |
 | `parse_args()` | Defines and parses all CLI flags. |
-| `resolve_config(args)` | Merges flags, prompts, and defaults into a single config dict; handles the `-` (no image) sentinel. |
+| `resolve_config(args)` | Merges flags, prompts, and defaults into a single config dict; handles the `-` (no image / no pipeline) sentinels. |
 | `confirm_config(cfg)` | Prints the resolved configuration and asks for the initial go-ahead. |
 | `get_account_id(session, label)` | Verifies credentials via `sts:GetCallerIdentity`. |
 | `verify_image_exists(...)` | Confirms an image tag exists in a repository. |
-| `start_and_wait_for_scan(...)` | Triggers a fresh ECR vulnerability scan and polls until it completes. |
-| `show_vulnerabilities(...)` | Prints the severity summary and a paged list of findings. |
+| `start_and_wait_for_scan(...)` | Triggers a fresh ECR vulnerability scan (unless `trigger_scan=False`) and polls until findings are complete. |
+| `show_vulnerabilities(..., trigger_scan=True)` | Prints the severity summary and a paged list of findings; `trigger_scan=False` reads existing findings without starting a new scan (used for the Destination Account's continuously-scanned repo). |
 | `print_paged(lines, page_size)` | Prints a list of lines in pages, pausing between pages. |
 | `invoke_copy_lambda(...)` | Invokes the copy Lambda and checks its response for errors. |
 | `wait_for_image_in_account_b(...)` | Polls the Destination Account's ECR until the copied image appears. |
@@ -188,9 +219,11 @@ sequenced flow aren't covered.
 
 ## Notes
 
-- Vulnerability findings always come from a freshly triggered scan
-  (`start_and_wait_for_scan`); if a scan is already in progress, the script
-  waits for it instead of starting another.
+- Vulnerability findings in the Source Account always come from a freshly
+  triggered scan (`start_and_wait_for_scan`); if a scan is already in
+  progress, the script waits for it instead of starting another.
+  Vulnerability findings in the Destination Account are read as-is
+  (`trigger_scan=False`) since that repo uses continuous scanning.
 - The Lambda copy step is confirmed two ways: the Lambda's response
   (`StatusCode` 200, no `FunctionError`) and a follow-up check that the
   image actually appears in the Destination Account's ECR.

@@ -137,6 +137,32 @@ def test_show_vulnerabilities_prints_summary(capsys):
     assert "HIGH" in out  # moto seeds one fake HIGH finding on every scan
 
 
+def test_show_vulnerabilities_trigger_scan_false_reads_existing_results(capsys):
+    # Continuous-scan repos don't support/need a manual StartImageScan call;
+    # trigger_scan=False must go straight to describe_image_scan_findings.
+    # Using Stubber (not moto) here so a single queued response also proves
+    # start_image_scan is never called for this path.
+    client = boto3.client("ecr", region_name="us-east-1")
+    stubber = Stubber(client)
+    stubber.add_response(
+        "describe_image_scan_findings",
+        {
+            "imageScanStatus": {"status": "COMPLETE", "description": "ok"},
+            "imageScanFindings": {
+                "findingSeverityCounts": {"HIGH": 1},
+                "findings": [{"name": "CVE-1", "severity": "HIGH", "description": "desc"}],
+            },
+        },
+        expected_params={"repositoryName": "myrepo", "imageId": {"imageTag": "1.0"}},
+    )
+    with stubber:
+        eds.show_vulnerabilities(client, "myrepo", "1.0", trigger_scan=False)
+    stubber.assert_no_pending_responses()
+    out = capsys.readouterr().out
+    assert "continuous scanning" in out
+    assert "HIGH" in out
+
+
 # --------------------------------------------------------------------------
 # wait_for_image_in_account_b (moto: ecr, + fake clock for the timeout path)
 # --------------------------------------------------------------------------
