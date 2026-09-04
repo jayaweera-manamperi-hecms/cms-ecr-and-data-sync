@@ -31,7 +31,8 @@ DEFAULT_APP_DATASYNC_TASK = "hp-cms-poc-app-artifacts-cms-non-prod-datasync"
 DEFAULT_INFRA_DATASYNC_TASK = "hp-cms-poc-infra-artifacts-cms-non-prod-datasync"
 DEFAULT_PIPELINE_NAME = "hp-cms-test-application-deploy-pipeline"
 
-SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNDEFINED"]
+SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL", "UNDEFINED", "UNTRIAGED"]
+MAX_INSPECTOR_FINDINGS = 100
 
 
 def prompt(text, default=None):
@@ -186,7 +187,30 @@ def start_and_wait_for_scan(ecr_client, repo, tag, poll_interval=5, timeout=300,
         return None
 
 
-def show_vulnerabilities(ecr_client, repo, tag, trigger_scan=True):
+def list_inspector_findings(inspector_client, repo, tag, max_items=MAX_INSPECTOR_FINDINGS):
+    """Per-finding detail for a continuously (enhanced) scanned image.
+
+    ECR's classic describe_image_scan_findings only populates
+    findingSeverityCounts for these images, not the findings[] list - the
+    itemized findings live in Inspector instead.
+    """
+    findings = []
+    try:
+        paginator = inspector_client.get_paginator("list_findings")
+        for page in paginator.paginate(
+            filterCriteria={
+                "ecrImageRepositoryName": [{"comparison": "EQUALS", "value": repo}],
+                "ecrImageTags": [{"comparison": "EQUALS", "value": tag}],
+            },
+            PaginationConfig={"MaxItems": max_items},
+        ):
+            findings.extend(page.get("findings", []))
+    except ClientError as e:
+        print(f"  Could not retrieve Inspector findings: {e}")
+    return findings
+
+
+def show_vulnerabilities(ecr_client, repo, tag, trigger_scan=True, inspector_client=None):
     resp = start_and_wait_for_scan(ecr_client, repo, tag, trigger_scan=trigger_scan)
     if resp is None:
         return
@@ -211,13 +235,20 @@ def show_vulnerabilities(ecr_client, repo, tag, trigger_scan=True):
         if severity in counts:
             print(f"    {severity:<14}: {counts[severity]}")
 
+    finding_list = findings.get("findings", [])
+    if not finding_list and inspector_client is not None:
+        finding_list = list_inspector_findings(inspector_client, repo, tag)
+
     severity_rank = {severity: i for i, severity in enumerate(SEVERITY_ORDER)}
     sorted_findings = sorted(
-        findings.get("findings", []),
+        finding_list,
         key=lambda f: severity_rank.get(f.get("severity"), len(SEVERITY_ORDER)),
     )
     print_paged(
-        [f"    [{f.get('severity')}] {f.get('name')} - {f.get('description', '')[:100]}" for f in sorted_findings]
+        [
+            f"    [{f.get('severity')}] {f.get('name') or f.get('title')} - {f.get('description', '')[:100]}"
+            for f in sorted_findings
+        ]
     )
 
 
@@ -421,7 +452,8 @@ def main():
         wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
 
         print("\n=== Vulnerability findings in the Destination Account ===")
-        show_vulnerabilities(ecr_b, cfg["repo"], cfg["tag"], trigger_scan=False)
+        inspector_b = session_b.client("inspector2")
+        show_vulnerabilities(ecr_b, cfg["repo"], cfg["tag"], trigger_scan=False, inspector_client=inspector_b)
 
     if prompt("\nContinue with running the DataSync tasks? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after copying the image.")
