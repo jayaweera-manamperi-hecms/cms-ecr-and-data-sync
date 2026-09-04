@@ -163,6 +163,30 @@ def test_show_vulnerabilities_trigger_scan_false_reads_existing_results(capsys):
     assert "HIGH" in out
 
 
+def test_show_vulnerabilities_trigger_scan_false_handles_active_status(capsys):
+    # Continuous-scanning repos report status ACTIVE indefinitely (no
+    # "in progress -> complete" lifecycle). A single queued response also
+    # proves this path makes exactly one call and never polls/hangs.
+    client = boto3.client("ecr", region_name="us-east-1")
+    stubber = Stubber(client)
+    stubber.add_response(
+        "describe_image_scan_findings",
+        {
+            "imageScanStatus": {"status": "ACTIVE"},
+            "imageScanFindings": {
+                "findingSeverityCounts": {"MEDIUM": 2},
+                "findings": [{"name": "CVE-2", "severity": "MEDIUM", "description": "desc"}],
+            },
+        },
+    )
+    with stubber:
+        eds.show_vulnerabilities(client, "myrepo", "1.0", trigger_scan=False)
+    stubber.assert_no_pending_responses()
+    out = capsys.readouterr().out
+    assert "MEDIUM" in out
+    assert "no final" in out.lower()
+
+
 # --------------------------------------------------------------------------
 # wait_for_image_in_account_b (moto: ecr, + fake clock for the timeout path)
 # --------------------------------------------------------------------------
