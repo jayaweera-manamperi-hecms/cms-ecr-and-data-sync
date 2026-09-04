@@ -49,7 +49,7 @@ def parse_args():
     p.add_argument("--lambda-name", help=f"Lambda function name in the Destination Account (default: {DEFAULT_LAMBDA_NAME})")
     p.add_argument("--app-datasync-task", help=f"App DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_APP_DATASYNC_TASK})")
     p.add_argument("--infra-datasync-task", help=f"Infra DataSync Task name (or ARN) (Destination Account) (default: {DEFAULT_INFRA_DATASYNC_TASK})")
-    p.add_argument("--pipeline-name", help=f"CodePipeline name triggered by the Infra DataSync Task (Destination Account) (default: {DEFAULT_PIPELINE_NAME})")
+    p.add_argument("--pipeline-name", help=f"CodePipeline name triggered by the Infra DataSync Task (Destination Account) (default: {DEFAULT_PIPELINE_NAME}) (pass - to skip waiting on CodePipeline/CodeBuild)")
     p.add_argument(
         "--no-dry-run",
         dest="dry_run",
@@ -88,7 +88,10 @@ def resolve_config(args):
     cfg["lambda_name"] = args.lambda_name or DEFAULT_LAMBDA_NAME
     cfg["app_datasync_task"] = args.app_datasync_task or prompt("App DataSync Task name (or ARN)", DEFAULT_APP_DATASYNC_TASK)
     cfg["infra_datasync_task"] = args.infra_datasync_task or prompt("Infra DataSync Task name (or ARN)", DEFAULT_INFRA_DATASYNC_TASK)
-    cfg["pipeline_name"] = args.pipeline_name or prompt("CodePipeline name", DEFAULT_PIPELINE_NAME)
+    pipeline_name = args.pipeline_name or prompt("CodePipeline name (or - to skip waiting on CodePipeline/CodeBuild)", DEFAULT_PIPELINE_NAME)
+    cfg["has_pipeline"] = pipeline_name != "-"
+    cfg["pipeline_name"] = pipeline_name if cfg["has_pipeline"] else None
+
     cfg["dry_run"] = args.dry_run
     return cfg
 
@@ -106,9 +109,14 @@ def confirm_config(cfg):
     print(f"  Lambda function     : {cfg['lambda_name']}")
     print(f"  App DataSync Task   : {cfg['app_datasync_task']} (name or ARN)")
     print(f"  Infra DataSync Task : {cfg['infra_datasync_task']} (name or ARN)")
-    print(f"  CodePipeline name   : {cfg['pipeline_name']}")
+    if cfg["has_pipeline"]:
+        print(f"  CodePipeline name   : {cfg['pipeline_name']}")
+    else:
+        print(f"  CodePipeline name   : (none - CodePipeline/CodeBuild wait will be skipped)")
     if cfg["dry_run"]:
         print(f"  Mode                : DRY RUN (no changes will be made)")
+    else:
+        print(f"  Mode                : REAL RUN (NO DRY RUN)")
     print()
     if prompt("Proceed with these values? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user.")
@@ -134,16 +142,19 @@ def verify_image_exists(ecr_client, repo, tag, label):
     return detail
 
 
-def start_and_wait_for_scan(ecr_client, repo, tag, poll_interval=5, timeout=300):
-    print("  Triggering new vulnerability scan...")
-    try:
-        ecr_client.start_image_scan(repositoryName=repo, imageId={"imageTag": tag})
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code == "LimitExceededException":
-            print("  A scan is already in progress; waiting for it to complete...")
-        else:
-            print(f"  Could not start new scan ({e}); showing latest available findings if any.")
+def start_and_wait_for_scan(ecr_client, repo, tag, poll_interval=5, timeout=300, trigger_scan=True):
+    if trigger_scan:
+        print("  Triggering new vulnerability scan...")
+        try:
+            ecr_client.start_image_scan(repositoryName=repo, imageId={"imageTag": tag})
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code == "LimitExceededException":
+                print("  A scan is already in progress; waiting for it to complete...")
+            else:
+                print(f"  Could not start new scan ({e}); showing latest available findings if any.")
+    else:
+        print("  Repository uses continuous scanning; reading the existing scan results...")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -167,8 +178,8 @@ def start_and_wait_for_scan(ecr_client, repo, tag, poll_interval=5, timeout=300)
         return None
 
 
-def show_vulnerabilities(ecr_client, repo, tag):
-    resp = start_and_wait_for_scan(ecr_client, repo, tag)
+def show_vulnerabilities(ecr_client, repo, tag, trigger_scan=True):
+    resp = start_and_wait_for_scan(ecr_client, repo, tag, trigger_scan=trigger_scan)
     if resp is None:
         return
 
@@ -380,7 +391,8 @@ def main():
             print(f"  Would wait for {cfg['repo']}:{cfg['tag']} to appear in the Destination Account's ECR.")
         print(f"  Would start the App DataSync Task ({cfg['app_datasync_task']}) and wait for SUCCESS.")
         print(f"  Would start the Infra DataSync Task ({cfg['infra_datasync_task']}) and wait for SUCCESS.")
-        print(f"  Would wait for a new execution of CodePipeline '{cfg['pipeline_name']}' and tail its CodeBuild logs.")
+        if cfg["has_pipeline"]:
+            print(f"  Would wait for a new execution of CodePipeline '{cfg['pipeline_name']}' and tail its CodeBuild logs.")
         sys.exit(0)
 
     datasync_b = session_b.client("datasync")
@@ -391,6 +403,9 @@ def main():
         lambda_b = session_b.client("lambda")
         invoke_copy_lambda(lambda_b, cfg["lambda_name"], cfg["repo"], cfg["tag"])
         wait_for_image_in_account_b(ecr_b, cfg["repo"], cfg["tag"])
+
+        print("\n=== Vulnerability findings in the Destination Account ===")
+        show_vulnerabilities(ecr_b, cfg["repo"], cfg["tag"], trigger_scan=False)
 
     if prompt("\nContinue with running the DataSync tasks? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after copying the image.")
@@ -408,6 +423,10 @@ def main():
     trigger_time = datetime.now(timezone.utc)
     if not run_datasync_task(datasync_b, infra_task_arn, "Infra DataSync Task"):
         sys.exit("Infra DataSync Task failed; aborting.")
+
+    if not cfg["has_pipeline"]:
+        print("\n=== No pipeline specified: skipping the CodePipeline / CodeBuild wait ===")
+        sys.exit(0)
 
     if prompt("\nContinue with waiting for CodePipeline / CodeBuild? [y/N]", "N").lower() != "y":
         sys.exit("Aborted by user after the Infra DataSync Task.")
