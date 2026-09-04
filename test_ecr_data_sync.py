@@ -187,6 +187,70 @@ def test_show_vulnerabilities_trigger_scan_false_handles_active_status(capsys):
     assert "no final" in out.lower()
 
 
+def test_show_vulnerabilities_falls_back_to_inspector_for_itemized_list(capsys):
+    # Enhanced/continuous-scanning images: ECR's classic scan-findings only
+    # populates findingSeverityCounts, never the findings[] list - the
+    # itemized list has to come from Inspector's list_findings instead.
+    ecr_client = boto3.client("ecr", region_name="us-east-1")
+    ecr_stub = Stubber(ecr_client)
+    ecr_stub.add_response(
+        "describe_image_scan_findings",
+        {
+            "imageScanStatus": {"status": "ACTIVE"},
+            "imageScanFindings": {
+                "findingSeverityCounts": {"CRITICAL": 1},
+                "findings": [],  # empty, even though the count above is 1
+            },
+        },
+    )
+
+    inspector_client = boto3.client("inspector2", region_name="us-east-1")
+    inspector_stub = Stubber(inspector_client)
+    inspector_stub.add_response(
+        "list_findings",
+        {
+            "findings": [
+                {
+                    "findingArn": "arn:aws:inspector2:us-east-1:123456789012:finding/abc",
+                    "awsAccountId": "123456789012",
+                    "type": "PACKAGE_VULNERABILITY",
+                    "title": "CVE-2024-0001 - openssl",
+                    "description": "a critical openssl vulnerability",
+                    "remediation": {},
+                    "severity": "CRITICAL",
+                    "firstObservedAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "lastObservedAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "updatedAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "status": "ACTIVE",
+                    "resources": [
+                        {
+                            "type": "AWS_ECR_CONTAINER_IMAGE",
+                            "id": "arn:aws:ecr:us-east-1:123456789012:repository/myrepo",
+                        }
+                    ],
+                }
+            ]
+        },
+        expected_params={
+            "filterCriteria": {
+                "ecrImageRepositoryName": [{"comparison": "EQUALS", "value": "myrepo"}],
+                "ecrImageTags": [{"comparison": "EQUALS", "value": "1.0"}],
+            },
+        },
+    )
+
+    with ecr_stub, inspector_stub:
+        eds.show_vulnerabilities(
+            ecr_client, "myrepo", "1.0", trigger_scan=False, inspector_client=inspector_client
+        )
+    ecr_stub.assert_no_pending_responses()
+    inspector_stub.assert_no_pending_responses()
+
+    out = capsys.readouterr().out
+    assert "CRITICAL      : 1" in out
+    assert "CVE-2024-0001 - openssl" in out
+
+
 # --------------------------------------------------------------------------
 # wait_for_image_in_account_b (moto: ecr, + fake clock for the timeout path)
 # --------------------------------------------------------------------------

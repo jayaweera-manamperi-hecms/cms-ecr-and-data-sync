@@ -65,6 +65,7 @@ expected to have triggered on its own.
 **Destination Account profile** needs:
 - `sts:GetCallerIdentity`
 - `ecr:DescribeImages`, `ecr:DescribeImageScanFindings` (only used when an image is given)
+- `inspector2:ListFindings` (only used when an image is given, and only called as a fallback — see [Destination Account scan findings](#destination-account-scan-findings))
 - `lambda:InvokeFunction` on the copy Lambda (only used when an image is given)
 - `datasync:ListTasks`, `datasync:StartTaskExecution`, `datasync:DescribeTaskExecution`
 - `codepipeline:ListPipelineExecutions`, `codepipeline:ListActionExecutions`
@@ -136,6 +137,16 @@ implemented; the Source Account call uses the default
 `trigger_scan=True`, which still triggers a scan and polls for
 `COMPLETE`/`FAILED`.)
 
+For continuously (enhanced) scanned images, `ecr:DescribeImageScanFindings`
+only ever populates `findingSeverityCounts` — the itemized `findings[]`
+list stays empty even when the counts are non-zero, since the per-finding
+detail lives in Amazon Inspector instead. When that happens,
+`show_vulnerabilities` automatically falls back to
+`list_inspector_findings`, which calls `inspector2:ListFindings` filtered
+to that repository/tag, so you still get an itemized (severity-sorted,
+description-truncated) list alongside the summary — the same as the
+Source Account path.
+
 ### Skipping the CodePipeline/CodeBuild wait
 
 Some runs don't need to wait on the pipeline (e.g. an image-copy-only or
@@ -178,7 +189,8 @@ Answering anything other than `y` at any of these aborts the run immediately.
 | `get_account_id(session, label)` | Verifies credentials via `sts:GetCallerIdentity`. |
 | `verify_image_exists(...)` | Confirms an image tag exists in a repository. |
 | `start_and_wait_for_scan(...)` | Triggers a fresh ECR vulnerability scan (unless `trigger_scan=False`) and polls until findings are complete. |
-| `show_vulnerabilities(..., trigger_scan=True)` | Prints the severity summary and a paged list of findings; `trigger_scan=False` reads existing findings without starting a new scan (used for the Destination Account's continuously-scanned repo). |
+| `list_inspector_findings(...)` | Fetches itemized per-finding detail via `inspector2:ListFindings`, for images where ECR's classic findings list is empty (continuous/enhanced scanning). |
+| `show_vulnerabilities(..., trigger_scan=True, inspector_client=None)` | Prints the severity summary and a paged, description-truncated list of findings; `trigger_scan=False` reads existing findings without starting a new scan, falling back to `list_inspector_findings` if `inspector_client` is given and ECR's own findings list is empty. |
 | `print_paged(lines, page_size)` | Prints a list of lines in pages, pausing between pages. |
 | `invoke_copy_lambda(...)` | Invokes the copy Lambda and checks its response for errors. |
 | `wait_for_image_in_account_b(...)` | Polls the Destination Account's ECR until the copied image appears. |
