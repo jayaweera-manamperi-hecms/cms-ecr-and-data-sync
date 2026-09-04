@@ -126,12 +126,15 @@ to the DataSync/CodePipeline confirmations and steps.
 After the copied image is confirmed to exist in the Destination Account,
 the script reads and prints its vulnerability scan findings the same way
 it does for the Source Account — except it does **not** call
-`ecr:StartImageScan` there. The destination repository is configured for
-continuous scanning, which doesn't support (or need) a manually triggered
-scan; findings are simply read via `ecr:DescribeImageScanFindings`, which
-are already kept up to date automatically. (`show_vulnerabilities(...,
-trigger_scan=False)` is how this is implemented; the Source Account call
-uses the default `trigger_scan=True`.)
+`ecr:StartImageScan` there, and it does **not** poll/wait. The destination
+repository is configured for continuous scanning, which has no manually
+triggered, in-progress-to-complete lifecycle to wait on (its status stays
+e.g. `ACTIVE` indefinitely); findings are read once via
+`ecr:DescribeImageScanFindings` and printed as-is, whatever the status.
+(`show_vulnerabilities(..., trigger_scan=False)` is how this is
+implemented; the Source Account call uses the default
+`trigger_scan=True`, which still triggers a scan and polls for
+`COMPLETE`/`FAILED`.)
 
 ### Skipping the CodePipeline/CodeBuild wait
 

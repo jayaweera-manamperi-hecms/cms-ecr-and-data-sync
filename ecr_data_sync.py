@@ -154,7 +154,15 @@ def start_and_wait_for_scan(ecr_client, repo, tag, poll_interval=5, timeout=300,
             else:
                 print(f"  Could not start new scan ({e}); showing latest available findings if any.")
     else:
+        # Continuous scanning has no "in progress -> complete" lifecycle to
+        # poll for (status just stays e.g. ACTIVE indefinitely) - read
+        # whatever results already exist and return immediately.
         print("  Repository uses continuous scanning; reading the existing scan results...")
+        try:
+            return ecr_client.describe_image_scan_findings(repositoryName=repo, imageId={"imageTag": tag})
+        except ClientError as e:
+            print(f"  Could not retrieve scan findings: {e}")
+            return None
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -184,11 +192,19 @@ def show_vulnerabilities(ecr_client, repo, tag, trigger_scan=True):
         return
 
     status = resp.get("imageScanStatus", {}).get("status")
-    if status != "COMPLETE":
-        print(f"  No completed scan available (status: {status}).")
-        return
+    findings = resp.get("imageScanFindings")
 
-    findings = resp["imageScanFindings"]
+    if trigger_scan:
+        if status != "COMPLETE":
+            print(f"  No completed scan available (status: {status}).")
+            return
+    else:
+        if not findings:
+            print(f"  No scan findings available yet (status: {status}).")
+            return
+        if status and status != "COMPLETE":
+            print(f"  (scan status: {status}; continuous scanning has no final \"complete\" state)")
+
     counts = findings.get("findingSeverityCounts", {})
     print("  Vulnerability summary:")
     for severity in SEVERITY_ORDER:
